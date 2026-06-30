@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TileLang JIT Kernel 编译路径学习笔记</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --text: #17202a;
+      --muted: #5f6b7a;
+      --border: #d8dee8;
+      --soft: #f6f8fb;
+      --code: #eef2f7;
+      --accent: #0b6bcb;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.65;
+      color: var(--text);
+      background: #fff;
+    }
+
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 40px 24px 64px;
+    }
+
+    h1, h2, h3 {
+      line-height: 1.25;
+      margin: 0;
+    }
+
+    h1 {
+      font-size: 30px;
+      margin-bottom: 8px;
+    }
+
+    h2 {
+      font-size: 22px;
+      margin-top: 36px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    h3 {
+      font-size: 17px;
+      margin-top: 22px;
+    }
+
+    p {
+      margin: 10px 0;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    code {
+      padding: 2px 5px;
+      border-radius: 4px;
+      background: var(--code);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      overflow: auto;
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--soft);
+      line-height: 1.5;
+    }
+
+    pre code {
+      padding: 0;
+      background: transparent;
+    }
+
+    ul, ol {
+      padding-left: 22px;
+      margin: 10px 0;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      margin-bottom: 28px;
+    }
+
+    .note {
+      border-left: 4px solid var(--accent);
+      background: var(--soft);
+      padding: 12px 14px;
+      margin: 16px 0;
+      border-radius: 0 8px 8px 0;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      background: #fff;
+    }
+
+    .card h3 {
+      margin-top: 0;
+      margin-bottom: 8px;
+    }
+
+    .path-list {
+      list-style: none;
+      padding-left: 0;
+    }
+
+    .path-list li {
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .path-list li:last-child {
+      border-bottom: 0;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>TileLang JIT Kernel 编译路径学习笔记</h1>
+    <p class="subtitle">从 Python DSL / PrimFunc 到最终 CUDA 源码与可执行 kernel 的主路径梳理。</p>
+
+    <section>
+      <h2>一、整体路径</h2>
+      <pre><code>Python DSL / @tilelang.jit
+  -&gt; PrimFunc / IRModule
+  -&gt; tilelang.compile / JITKernel
+  -&gt; tilelang.lower
+  -&gt; LowerAndLegalize + OptimizeForTarget
+  -&gt; host/device IR split
+  -&gt; target.build.tilelang_cuda(_without_compile)
+  -&gt; CodeGenTileLangCUDA 生成 CUDA C++
+  -&gt; adapter 编译、加载、封装调用</code></pre>
+
+      <p>可以把编译链路分成四层：前端生成 TIR、JIT 调度编译、TileLang/TVM pass 降低优化、CUDA codegen 与运行时封装。</p>
+    </section>
+
+    <section>
+      <h2>二、前端入口：Python 代码到 PrimFunc</h2>
+      <div class="grid">
+        <article class="card">
+          <h3><code>@tilelang.jit</code></h3>
+          <p>装饰器入口在 <code>tilelang/jit/__init__.py</code>。它把 Python 函数包装成 <code>JITImpl</code>，支持 lazy 和 eager 两种模式。</p>
+        </article>
+        <article class="card">
+          <h3><code>tilelang.compile</code></h3>
+          <p>直接编译已有 <code>PrimFunc</code>。入口同样在 <code>tilelang/jit/__init__.py</code>，之后进入缓存和 <code>JITKernel</code>。</p>
+        </article>
+        <article class="card">
+          <h3><code>T.Kernel</code></h3>
+          <p>建立 kernel launch frame，记录 grid/block/thread 绑定，位置在 <code>tilelang/language/kernel.py</code>。</p>
+        </article>
+      </div>
+
+      <p>lazy 模式通常是用户显式返回 <code>@T.prim_func</code> 产生的 <code>PrimFunc</code>；eager 模式则通过 <code>tilelang/language/eager/builder.py</code> 的 builder 在执行 Python 函数时构造 TIR。</p>
+    </section>
+
+    <section>
+      <h2>三、JITKernel：编译调度与 adapter 选择</h2>
+      <p><code>tilelang.compile</code> 会经过 <code>tilelang/cache/kernel_cache.py</code> 的缓存逻辑，cache miss 后创建 <code>JITKernel</code>。</p>
+      <p>核心方法是 <code>JITKernel._compile_and_create_adapter</code>，位置在 <code>tilelang/jit/kernel.py</code>。它负责：</p>
+      <ul>
+        <li>规范化 target、execution backend、pass config 和 compile flags。</li>
+        <li>创建 <code>tvm.transform.PassContext</code>。</li>
+        <li>调用 <code>tilelang.lower(...)</code> 得到 <code>CompiledArtifact</code>。</li>
+        <li>根据 backend 创建 <code>TVMFFIKernelAdapter</code>、<code>NVRTCKernelAdapter</code>、<code>CythonKernelAdapter</code> 等。</li>
+      </ul>
+
+      <div class="note">
+        <strong>注意：</strong><code>tvm_ffi</code> backend 会在 <code>tilelang.lower</code> 阶段启用 host codegen 和 device compile；<code>nvrtc</code>、<code>cython</code> 等路径通常先拿 CUDA source，再由 adapter 负责编译/封装。
+      </div>
+    </section>
+
+    <section>
+      <h2>四、lower：PrimFunc 到 host/device IR</h2>
+      <p><code>tilelang.lower</code> 位于 <code>tilelang/engine/lower.py</code>。主函数会先调用 <code>lower_to_host_device_ir</code>，完成 IR 降低和 host/device 拆分。</p>
+
+      <ol>
+        <li>如果输入是 <code>PrimFunc</code>，先包装成 <code>IRModule</code>。</li>
+        <li>解析 <code>target</code> 与 <code>target_host</code>。</li>
+        <li>执行 <code>PreLowerSemanticCheck</code>。</li>
+        <li>执行 <code>LowerAndLegalize</code>。</li>
+        <li>执行 <code>OptimizeForTarget</code>。</li>
+        <li>根据 <code>CallingConv.DEVICE_KERNEL_LAUNCH</code> 过滤出 <code>host_mod</code> 和 <code>device_mod</code>。</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>五、主要 pass pipeline</h2>
+
+      <h3><code>LowerAndLegalize</code></h3>
+      <p>位置：<code>tilelang/engine/phase.py</code>。这一阶段更偏前端语义合法化和高层 Tile IR 降低。</p>
+      <ul>
+        <li><code>BindTarget</code>：把 target 绑定到模块。</li>
+        <li><code>LegalizeNegativeIndex</code>、<code>VerifyParallelLoop</code>、<code>InjectAssumes</code>、<code>Simplify</code>。</li>
+        <li><code>LayoutReducer</code>、<code>LayoutInference</code>：处理 fragment/shared memory 布局。</li>
+        <li><code>ProducerConsumerWarpSpecialized</code>、<code>PipelinePlanning</code>、<code>InjectSoftwarePipeline</code>。</li>
+        <li><code>LowerTileOp</code>：把高层 tile op 降到更低层操作。</li>
+        <li><code>LowerL2Persistent</code>、<code>LegalizeVectorizedLoop</code>、<code>LegalizeSafeMemoryAccess</code>、<code>LowerAccessPtr</code>。</li>
+      </ul>
+
+      <h3><code>OptimizeForTarget</code></h3>
+      <p>位置同样在 <code>tilelang/engine/phase.py</code>。这一阶段更偏 CUDA/TIR 后端优化和设备函数准备。</p>
+      <ul>
+        <li><code>LowerSharedTmem</code>、<code>LowerSharedBarrier</code>、<code>PlanAndUpdateBufferAllocationLocation</code>。</li>
+        <li><code>FlattenBuffer</code>、<code>VectorizeLoop</code>、<code>StorageRewrite</code>、<code>UnrollLoop</code>。</li>
+        <li><code>LowerThreadAllreduce</code>、<code>LowerLDGSTG</code>、<code>LowerHopperIntrin</code>。</li>
+        <li><code>AnnotateDeviceRegions</code>、<code>SplitHostDevice</code>：为 host/device 拆分做准备并完成拆分。</li>
+        <li><code>MergeSharedMemoryAllocations</code>、<code>ThreadSync</code>、<code>MakePackedAPI</code>、<code>LowerDeviceKernelLaunch</code>。</li>
+        <li><code>PersistThreadblock</code>：CUDA threadblock 持久化相关变换。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>六、device IR 到 CUDA source</h2>
+      <p><code>tilelang.lower</code> 对 <code>device_mod</code> 调用 codegen：</p>
+      <ul>
+        <li><code>device_codegen</code>：生成 CUDA source，并通过 nvcc callback 编译成 cubin，主要用于 <code>tvm_ffi</code>。</li>
+        <li><code>device_codegen_without_compile</code>：只生成 CUDA source，主要用于 <code>nvrtc</code>、<code>cython</code> 等 adapter 后续处理。</li>
+      </ul>
+
+      <p>CUDA target 最终调用 C++ FFI 注册函数：</p>
+      <pre><code>target.build.tilelang_cuda
+target.build.tilelang_cuda_without_compile</code></pre>
+
+      <p>注册和入口在 <code>src/backend/cuda/codegen/rt_mod_cuda.cc</code>。它会创建 <code>CodeGenTileLangCUDA</code>，遍历 device <code>PrimFunc</code>，调用 <code>cg.AddFunction(...)</code>，最后通过 <code>cg.Finish()</code> 得到完整 CUDA C++ 源码。</p>
+    </section>
+
+    <section>
+      <h2>七、CUDA codegen 的关键点</h2>
+      <p>主要实现文件：<code>src/backend/cuda/codegen/codegen_cuda.cc</code>。</p>
+      <ul>
+        <li><code>PrintFuncPrefix</code>：输出 <code>extern "C" __global__</code>。</li>
+        <li><code>PrintExtraAttrs</code>：从 <code>thread_extent</code> 提取线程数，生成 <code>__launch_bounds__</code>。</li>
+        <li><code>AddFunction</code>：把 device <code>PrimFunc</code> 打印成 CUDA kernel 函数。</li>
+        <li><code>Finish</code>：拼接 CUDA 头文件、TileLang template 头文件和最终源码。</li>
+      </ul>
+
+      <p>CUDA template 和 intrinsic 相关文件集中在：</p>
+      <ul>
+        <li><code>src/tl_templates/cuda/</code>：copy、gemm、reduce、debug、MMA/WGMMA/TCGEN05 等模板。</li>
+        <li><code>src/backend/cuda/op/</code>：CUDA op lowering 和指令选择相关实现。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>八、最终编译、加载和调用</h2>
+      <p>生成的 CUDA source 会保存在 <code>CompiledArtifact.kernel_source</code>，adapter 再把它封装为 Python 可调用对象。</p>
+
+      <h3><code>tvm_ffi</code> 路径</h3>
+      <p>adapter 在 <code>tilelang/jit/adapter/tvm_ffi.py</code>。这一条路径使用 TVM runtime module，host module 会 import device module，最终通过 TVM executable 调用。</p>
+
+      <h3><code>nvrtc</code> 路径</h3>
+      <p>adapter 在 <code>tilelang/jit/adapter/nvrtc/adapter.py</code>，编译器在 <code>tilelang/jit/adapter/nvrtc/libgen.py</code>。</p>
+      <ul>
+        <li>使用生成的 CUDA source 写出临时 <code>.cu</code>。</li>
+        <li>通过 NVRTC 编译出 <code>.cubin</code>。</li>
+        <li>生成 Python launcher <code>.py</code>。</li>
+        <li>通过 CUDA Driver API 加载 cubin 并取 kernel handle。</li>
+      </ul>
+
+      <p>launcher 生成逻辑主要在 <code>tilelang/jit/adapter/wrapper.py</code>，负责生成 kernel launch、dynamic shared memory、cluster launch、TMA descriptor 等 host 侧调用代码。</p>
+    </section>
+
+    <section>
+      <h2>九、关键文件索引</h2>
+      <ul class="path-list">
+        <li><code>tilelang/jit/__init__.py</code><br><span class="muted">JIT decorator、<code>compile</code>、lazy/eager 调度。</span></li>
+        <li><code>tilelang/jit/kernel.py</code><br><span class="muted"><code>JITKernel</code>，调用 <code>tilelang.lower</code> 并选择 adapter。</span></li>
+        <li><code>tilelang/cache/kernel_cache.py</code><br><span class="muted">kernel 编译缓存，cache miss 后构造 <code>JITKernel</code>。</span></li>
+        <li><code>tilelang/language/kernel.py</code><br><span class="muted"><code>T.Kernel</code> 和 <code>T.CUDASourceCodeKernel</code> 前端 launch frame。</span></li>
+        <li><code>tilelang/language/eager/builder.py</code><br><span class="muted">eager JIT builder，把 Python DSL 执行过程转成 TIR。</span></li>
+        <li><code>tilelang/engine/lower.py</code><br><span class="muted">lower 总入口、host/device IR split、device/host codegen 调度。</span></li>
+        <li><code>tilelang/engine/phase.py</code><br><span class="muted">主要 pass pipeline：<code>LowerAndLegalize</code> 与 <code>OptimizeForTarget</code>。</span></li>
+        <li><code>src/transform/split_host_device.cc</code><br><span class="muted">host/device 拆分相关 C++ pass。</span></li>
+        <li><code>src/backend/cuda/codegen/rt_mod_cuda.cc</code><br><span class="muted">CUDA build FFI 注册点：<code>target.build.tilelang_cuda*</code>。</span></li>
+        <li><code>src/backend/cuda/codegen/codegen_cuda.cc</code><br><span class="muted">CUDA C++ 代码生成器 <code>CodeGenTileLangCUDA</code>。</span></li>
+        <li><code>src/tl_templates/cuda/</code><br><span class="muted">TileLang CUDA template 头文件。</span></li>
+        <li><code>tilelang/jit/adapter/nvrtc/</code><br><span class="muted">NVRTC 编译、加载 cubin、Python launcher。</span></li>
+        <li><code>tilelang/jit/adapter/tvm_ffi.py</code><br><span class="muted">TVM runtime 路径的执行适配。</span></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>十、建议阅读顺序</h2>
+      <ol>
+        <li>先读 <code>tilelang/jit/__init__.py</code> 的 <code>jit</code> 和 <code>compile</code>。</li>
+        <li>再读 <code>tilelang/jit/kernel.py</code> 的 <code>_compile_and_create_adapter</code>。</li>
+        <li>接着读 <code>tilelang/engine/lower.py</code> 的 <code>lower_to_host_device_ir</code> 和 <code>lower</code>。</li>
+        <li>重点看 <code>tilelang/engine/phase.py</code> 两个 pipeline。</li>
+        <li>最后看 <code>rt_mod_cuda.cc</code> 与 <code>codegen_cuda.cc</code>，确认 CUDA source 是怎么打印出来的。</li>
+      </ol>
+    </section>
+  </main>
+</body>
+</html>
